@@ -42,6 +42,21 @@ type Session struct {
 
 	mu             sync.Mutex
 	uploadedChunks map[int]bool
+	chunkLocks     sync.Map // map[int]*sync.Mutex — per-chunk lock for concurrent uploads
+}
+
+// GetChunkLock returns the mutex for a specific chunk index, creating it if needed.
+func (s *Session) GetChunkLock(index int) *sync.Mutex {
+	lockVal, _ := s.chunkLocks.LoadOrStore(index, &sync.Mutex{})
+	return lockVal.(*sync.Mutex)
+}
+
+// IsChunkUploaded checks if a specific chunk has been uploaded (without locking uploadedChunks).
+// This is used after acquiring the per-chunk lock to skip redundant writes.
+func (s *Session) IsChunkUploaded(index int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.uploadedChunks[index]
 }
 
 // MarkChunkUploaded marks a chunk as uploaded.

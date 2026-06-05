@@ -176,6 +176,23 @@ func ChunkedUploadChunk(c *gin.Context) {
 		return
 	}
 
+	// Per-chunk lock: serialize concurrent uploads of the same chunk index
+	// to prevent data corruption from overlapping writes.
+	lock := session.GetChunkLock(chunkIndex)
+	lock.Lock()
+	defer lock.Unlock()
+
+	// If another goroutine already wrote this chunk, drain body and return success
+	if session.IsChunkUploaded(chunkIndex) {
+		io.Copy(io.Discard, c.Request.Body)
+		common.SuccessResp(c, gin.H{
+			"chunk_index":     chunkIndex,
+			"uploaded_chunks": session.UploadedCount(),
+			"total_chunks":    session.TotalChunks,
+		})
+		return
+	}
+
 	// Write chunk data to file, limiting read size to prevent disk exhaustion.
 	// Allow a small margin (4KB) over the expected chunk size for encoding overhead.
 	chunkPath := chunked_upload.ChunkPath(uploadID, chunkIndex)
@@ -197,7 +214,6 @@ func ChunkedUploadChunk(c *gin.Context) {
 	}
 
 	// Mark as uploaded only after successful write.
-	// If this chunk was already uploaded (concurrent retry), the second mark is a no-op.
 	session.MarkChunkUploaded(chunkIndex)
 
 	common.SuccessResp(c, gin.H{
