@@ -10,9 +10,11 @@ import (
 
 	"github.com/OpenListTeam/OpenList/v4/internal/chunked_upload"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/setting"
+	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	"github.com/gin-gonic/gin"
 )
@@ -23,6 +25,10 @@ type ChunkedCreateReq struct {
 	Name         string `json:"name"`
 	MimeType     string `json:"mime_type"`
 	LastModified int64  `json:"last_modified"` // millisecond timestamp
+	// Optional hash values for rapid upload / deduplication
+	Md5    string `json:"md5"`
+	Sha1   string `json:"sha1"`
+	Sha256 string `json:"sha256"`
 }
 
 type ChunkedCompleteReq struct {
@@ -62,6 +68,17 @@ func ChunkedUploadCreate(c *gin.Context) {
 		return
 	}
 
+	// Validate file name
+	if req.Name == "" {
+		req.Name = path.Base(filePath)
+	}
+
+	// Check if system file should be ignored (same as FsStream/FsForm)
+	if setting.GetBool(conf.IgnoreSystemFiles) && utils.IsSystemFile(req.Name) {
+		common.ErrorStrResp(c, errs.IgnoredSystemFile.Error(), 403)
+		return
+	}
+
 	// Check overwrite
 	overwrite := c.GetHeader("Overwrite") != "false"
 	if !overwrite {
@@ -69,11 +86,6 @@ func ChunkedUploadCreate(c *gin.Context) {
 			common.ErrorStrResp(c, "file exists", 403)
 			return
 		}
-	}
-
-	// Validate file name
-	if req.Name == "" {
-		req.Name = path.Base(filePath)
 	}
 
 	// Validate file size
@@ -96,9 +108,16 @@ func ChunkedUploadCreate(c *gin.Context) {
 		chunkSize = chunked_upload.MaxChunkSize
 	}
 
-	// Create session
+	// Mimetype fallback: derive from file name if not provided (same as FsStream)
+	mimeType := req.MimeType
+	if mimeType == "" {
+		mimeType = utils.GetMimeType(req.Name)
+	}
+
+	// Create session with user ownership
 	session := chunked_upload.GlobalSessionManager.Create(
-		req.Name, filePath, req.Size, chunkSize, req.MimeType, req.LastModified,
+		user.ID, req.Name, filePath, req.Size, chunkSize, mimeType, req.LastModified,
+		req.Md5, req.Sha1, req.Sha256,
 	)
 
 	// Create chunk directory
@@ -145,12 +164,34 @@ func ChunkedUploadChunk(c *gin.Context) {
 		return
 	}
 
+	// Verify user ownership: only the session creator (or admin) can upload chunks
+	user := c.Request.Context().Value(conf.UserKey).(*model.User)
+	if user.ID != session.UserID && !user.IsAdmin() {
+		common.ErrorStrResp(c, "permission denied", 403)
+		return
+	}
+
 	if chunkIndex < 0 || chunkIndex >= session.TotalChunks {
 		common.ErrorStrResp(c, fmt.Sprintf("chunk index out of range [0, %d)", session.TotalChunks), 400)
 		return
 	}
 
-	// Write chunk data to file
+	// Protect against concurrent writes to the same chunk index.
+	// MarkChunkUploaded returns false if this chunk was already uploaded,
+	// which prevents duplicate/corrupt writes from retries.
+	if !session.MarkChunkUploaded(chunkIndex) {
+		// Chunk already marked — drain body and return success (idempotent for retries)
+		_, _ = io.Copy(io.Discard, c.Request.Body)
+		common.SuccessResp(c, gin.H{
+			"chunk_index":     chunkIndex,
+			"uploaded_chunks": session.UploadedCount(),
+			"total_chunks":    session.TotalChunks,
+		})
+		return
+	}
+
+	// Write chunk data to file, limiting read size to prevent disk exhaustion.
+	// Allow a small margin (4KB) over the expected chunk size for encoding overhead.
 	chunkPath := chunked_upload.ChunkPath(uploadID, chunkIndex)
 	out, err := os.Create(chunkPath)
 	if err != nil {
@@ -159,15 +200,15 @@ func ChunkedUploadChunk(c *gin.Context) {
 	}
 	defer out.Close()
 
-	written, err := io.Copy(out, c.Request.Body)
+	limit := session.ChunkSize + 4096
+	limitedReader := io.LimitReader(c.Request.Body, limit)
+
+	written, err := io.Copy(out, limitedReader)
 	if err != nil {
 		os.Remove(chunkPath)
 		common.ErrorResp(c, fmt.Errorf("failed to write chunk data: %w", err), 500)
 		return
 	}
-
-	// Mark chunk as uploaded
-	session.MarkChunkUploaded(chunkIndex)
 
 	common.SuccessResp(c, gin.H{
 		"chunk_index":     chunkIndex,
@@ -196,11 +237,31 @@ func ChunkedUploadComplete(c *gin.Context) {
 		return
 	}
 
+	// Verify user ownership: only the session creator (or admin) can complete the upload
+	user := c.Request.Context().Value(conf.UserKey).(*model.User)
+	if user.ID != session.UserID && !user.IsAdmin() {
+		common.ErrorStrResp(c, "permission denied", 403)
+		return
+	}
+
 	if !session.IsComplete() {
 		common.ErrorStrResp(c, fmt.Sprintf("not all chunks uploaded: %d/%d",
 			session.UploadedCount(), session.TotalChunks), 400)
 		return
 	}
+
+	// Build hash info from session (for rapid upload / deduplication if provided)
+	hashMap := make(map[*utils.HashType]string)
+	if session.HashMd5 != "" {
+		hashMap[utils.MD5] = session.HashMd5
+	}
+	if session.HashSha1 != "" {
+		hashMap[utils.SHA1] = session.HashSha1
+	}
+	if session.HashSha256 != "" {
+		hashMap[utils.SHA256] = session.HashSha256
+	}
+	hashInfo := utils.NewHashInfoByMap(hashMap)
 
 	// Merge chunks into a single reader
 	mergedReader, cleanup, err := chunked_upload.MergeChunks(session)
@@ -210,7 +271,7 @@ func ChunkedUploadComplete(c *gin.Context) {
 	}
 
 	// Build FileStream
-	fileStream := chunked_upload.BuildFileStream(session, mergedReader, cleanup)
+	fileStream := chunked_upload.BuildFileStream(session, mergedReader, cleanup, hashInfo)
 	fileStream.WebPutAsTask = req.AsTask
 
 	dir, _ := path.Split(session.FilePath)
@@ -278,6 +339,15 @@ func ChunkedUploadAbort(c *gin.Context) {
 	if req.UploadID == "" {
 		common.ErrorStrResp(c, "missing upload_id", 400)
 		return
+	}
+
+	// Verify user ownership before aborting
+	if session, ok := chunked_upload.GlobalSessionManager.Get(req.UploadID); ok {
+		user := c.Request.Context().Value(conf.UserKey).(*model.User)
+		if user.ID != session.UserID && !user.IsAdmin() {
+			common.ErrorStrResp(c, "permission denied", 403)
+			return
+		}
 	}
 
 	chunked_upload.GlobalSessionManager.Delete(req.UploadID)

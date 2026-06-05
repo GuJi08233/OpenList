@@ -1,6 +1,7 @@
 package chunked_upload
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"time"
@@ -11,7 +12,8 @@ import (
 )
 
 // MergeChunks opens all chunk files in order and returns an io.Reader
-// that reads them sequentially, plus a cleanup function.
+// that reads them sequentially, plus a cleanup function that closes all file handles.
+// Note: directory removal is handled separately by SessionManager.Delete.
 func MergeChunks(session *Session) (io.Reader, func() error, error) {
 	readers := make([]io.Reader, 0, session.TotalChunks)
 	closers := make([]io.Closer, 0, session.TotalChunks)
@@ -19,10 +21,11 @@ func MergeChunks(session *Session) (io.Reader, func() error, error) {
 	for i := 0; i < session.TotalChunks; i++ {
 		f, err := os.Open(ChunkPath(session.UploadID, i))
 		if err != nil {
+			// Close any files already opened before returning error
 			for _, c := range closers {
 				c.Close()
 			}
-			return nil, nil, err
+			return nil, nil, fmt.Errorf("failed to open chunk %d: %w", i, err)
 		}
 		readers = append(readers, f)
 		closers = append(closers, f)
@@ -30,17 +33,20 @@ func MergeChunks(session *Session) (io.Reader, func() error, error) {
 
 	merged := io.MultiReader(readers...)
 	cleanup := func() error {
+		var firstErr error
 		for _, c := range closers {
-			c.Close()
+			if err := c.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
-		os.RemoveAll(ChunkDir(session.UploadID))
-		return nil
+		return firstErr
 	}
 	return merged, cleanup, nil
 }
 
-// BuildFileStream creates a FileStream from a merged session
-func BuildFileStream(session *Session, reader io.Reader, cleanup func() error) *stream.FileStream {
+// BuildFileStream creates a FileStream from a merged session.
+// hashInfo may be nil if no hash values are provided.
+func BuildFileStream(session *Session, reader io.Reader, cleanup func() error, hashInfo utils.HashInfo) *stream.FileStream {
 	lastModified := time.Now()
 	if session.LastModified > 0 {
 		lastModified = time.UnixMilli(session.LastModified)
@@ -50,6 +56,7 @@ func BuildFileStream(session *Session, reader io.Reader, cleanup func() error) *
 			Name:     session.FileName,
 			Size:     session.FileSize,
 			Modified: lastModified,
+			HashInfo: hashInfo,
 		},
 		Reader:   reader,
 		Mimetype: session.MimeType,

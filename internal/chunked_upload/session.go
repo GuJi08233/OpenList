@@ -4,6 +4,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -23,6 +24,7 @@ const (
 // Session represents an in-progress chunked upload
 type Session struct {
 	UploadID     string `json:"upload_id"`
+	UserID       uint   `json:"user_id"` // owner user ID for ownership validation
 	FileName     string `json:"file_name"`
 	FilePath     string `json:"file_path"` // destination path (after JoinPath validation)
 	FileSize     int64  `json:"file_size"`
@@ -33,15 +35,25 @@ type Session struct {
 	CreatedAt    int64  `json:"created_at"`    // unix timestamp
 	ExpiresAt    int64  `json:"expires_at"`    // unix timestamp
 
+	// Hash values for rapid upload / deduplication (optional)
+	HashMd5    string `json:"hash_md5"`
+	HashSha1   string `json:"hash_sha1"`
+	HashSha256 string `json:"hash_sha256"`
+
 	mu             sync.Mutex
 	uploadedChunks map[int]bool
 }
 
-// MarkChunkUploaded marks a chunk as uploaded
-func (s *Session) MarkChunkUploaded(index int) {
+// MarkChunkUploaded marks a chunk as uploaded.
+// Returns false if the chunk was already marked (prevents concurrent duplicate writes).
+func (s *Session) MarkChunkUploaded(index int) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.uploadedChunks[index] {
+		return false
+	}
 	s.uploadedChunks[index] = true
+	return true
 }
 
 // GetUploadedChunks returns a sorted list of uploaded chunk indices
@@ -52,6 +64,7 @@ func (s *Session) GetUploadedChunks() []int {
 	for idx := range s.uploadedChunks {
 		result = append(result, idx)
 	}
+	sort.Ints(result)
 	return result
 }
 
@@ -83,11 +96,12 @@ type SessionManager struct {
 var GlobalSessionManager = &SessionManager{}
 
 // Create creates a new chunked upload session
-func (m *SessionManager) Create(fileName, filePath string, fileSize, chunkSize int64, mimeType string, lastModified int64) *Session {
+func (m *SessionManager) Create(userID uint, fileName, filePath string, fileSize, chunkSize int64, mimeType string, lastModified int64, md5, sha1, sha256 string) *Session {
 	totalChunks := int(math.Ceil(float64(fileSize) / float64(chunkSize)))
 	now := time.Now()
 	s := &Session{
 		UploadID:       GenerateUploadID(),
+		UserID:         userID,
 		FileName:       fileName,
 		FilePath:       filePath,
 		FileSize:       fileSize,
@@ -97,6 +111,9 @@ func (m *SessionManager) Create(fileName, filePath string, fileSize, chunkSize i
 		LastModified:   lastModified,
 		CreatedAt:      now.Unix(),
 		ExpiresAt:      now.Add(SessionTTL).Unix(),
+		HashMd5:        md5,
+		HashSha1:       sha1,
+		HashSha256:     sha256,
 		uploadedChunks: make(map[int]bool),
 	}
 	m.sessions.Store(s.UploadID, s)
