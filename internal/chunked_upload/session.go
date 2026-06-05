@@ -1,0 +1,152 @@
+package chunked_upload
+
+import (
+	"math"
+	"os"
+	"path/filepath"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/pkg/utils/random"
+)
+
+const (
+	DefaultChunkSize = 50 * 1024 * 1024 // 50MB
+	MinChunkSize     = 5 * 1024 * 1024  // 5MB
+	MaxChunkSize     = 90 * 1024 * 1024 // 90MB (< Cloudflare 100MB limit)
+	SessionTTL       = 24 * time.Hour
+	CleanupInterval  = 30 * time.Minute
+)
+
+// Session represents an in-progress chunked upload
+type Session struct {
+	UploadID     string `json:"upload_id"`
+	FileName     string `json:"file_name"`
+	FilePath     string `json:"file_path"` // destination path (after JoinPath validation)
+	FileSize     int64  `json:"file_size"`
+	ChunkSize    int64  `json:"chunk_size"`
+	TotalChunks  int    `json:"total_chunks"`
+	MimeType     string `json:"mime_type"`
+	LastModified int64  `json:"last_modified"` // millisecond timestamp
+	CreatedAt    int64  `json:"created_at"`    // unix timestamp
+	ExpiresAt    int64  `json:"expires_at"`    // unix timestamp
+
+	mu             sync.Mutex
+	uploadedChunks map[int]bool
+}
+
+// MarkChunkUploaded marks a chunk as uploaded
+func (s *Session) MarkChunkUploaded(index int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.uploadedChunks[index] = true
+}
+
+// GetUploadedChunks returns a sorted list of uploaded chunk indices
+func (s *Session) GetUploadedChunks() []int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result := make([]int, 0, len(s.uploadedChunks))
+	for idx := range s.uploadedChunks {
+		result = append(result, idx)
+	}
+	return result
+}
+
+// UploadedCount returns the number of uploaded chunks
+func (s *Session) UploadedCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.uploadedChunks)
+}
+
+// IsComplete returns true if all chunks have been uploaded
+func (s *Session) IsComplete() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.uploadedChunks) == s.TotalChunks
+}
+
+// IsExpired returns true if the session has expired
+func (s *Session) IsExpired() bool {
+	return time.Now().Unix() > s.ExpiresAt
+}
+
+// SessionManager manages all active chunked upload sessions
+type SessionManager struct {
+	sessions sync.Map // map[string]*Session
+}
+
+// GlobalSessionManager is the global session manager instance
+var GlobalSessionManager = &SessionManager{}
+
+// Create creates a new chunked upload session
+func (m *SessionManager) Create(fileName, filePath string, fileSize, chunkSize int64, mimeType string, lastModified int64) *Session {
+	totalChunks := int(math.Ceil(float64(fileSize) / float64(chunkSize)))
+	now := time.Now()
+	s := &Session{
+		UploadID:       GenerateUploadID(),
+		FileName:       fileName,
+		FilePath:       filePath,
+		FileSize:       fileSize,
+		ChunkSize:      chunkSize,
+		TotalChunks:    totalChunks,
+		MimeType:       mimeType,
+		LastModified:   lastModified,
+		CreatedAt:      now.Unix(),
+		ExpiresAt:      now.Add(SessionTTL).Unix(),
+		uploadedChunks: make(map[int]bool),
+	}
+	m.sessions.Store(s.UploadID, s)
+	return s
+}
+
+// Get retrieves a session by upload ID
+func (m *SessionManager) Get(uploadID string) (*Session, bool) {
+	val, ok := m.sessions.Load(uploadID)
+	if !ok {
+		return nil, false
+	}
+	return val.(*Session), true
+}
+
+// Delete removes a session and its chunk files from disk
+func (m *SessionManager) Delete(uploadID string) {
+	m.sessions.Delete(uploadID)
+	os.RemoveAll(ChunkDir(uploadID))
+}
+
+// Cleanup removes all expired sessions and their chunk files
+func (m *SessionManager) Cleanup() {
+	now := time.Now().Unix()
+	m.sessions.Range(func(key, value any) bool {
+		session := value.(*Session)
+		if now > session.ExpiresAt {
+			os.RemoveAll(ChunkDir(session.UploadID))
+			m.sessions.Delete(key)
+		}
+		return true
+	})
+}
+
+// GenerateUploadID creates a random upload ID
+func GenerateUploadID() string {
+	return random.String(16)
+}
+
+// ChunkDir returns the filesystem path for chunk storage
+func ChunkDir(uploadID string) string {
+	return filepath.Join(conf.Conf.TempDir, "chunks", uploadID)
+}
+
+// ChunkPath returns the filesystem path for a specific chunk
+func ChunkPath(uploadID string, chunkIndex int) string {
+	return filepath.Join(ChunkDir(uploadID), "chunk_"+strconv.Itoa(chunkIndex))
+}
+
+// CalcTotalChunks calculates the total number of chunks
+func CalcTotalChunks(fileSize, chunkSize int64) int {
+	return int(math.Ceil(float64(fileSize) / float64(chunkSize)))
+}

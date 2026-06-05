@@ -187,6 +187,8 @@ func InitialSettings() []model.SettingItem {
 		{Key: conf.HandleHookAfterWriting, Value: "false", Type: conf.TypeBool, Group: model.GLOBAL, Flag: model.PRIVATE},
 		{Key: conf.HandleHookRateLimit, Value: "0", Type: conf.TypeNumber, Group: model.GLOBAL, Flag: model.PRIVATE},
 		{Key: conf.IgnoreSystemFiles, Value: "false", Type: conf.TypeBool, Group: model.GLOBAL, Flag: model.PRIVATE, Help: `When enabled, ignores common system files during upload (.DS_Store, desktop.ini, Thumbs.db, and files starting with ._)`},
+		{Key: conf.EnableChunkedUpload, Value: "false", Type: conf.TypeBool, Group: model.GLOBAL, Flag: model.PUBLIC, Help: `Enable client-side chunked upload to bypass reverse proxy body size limits (e.g. Cloudflare 100MB)`},
+		{Key: conf.ChunkedUploadSize, Value: "50", Type: conf.TypeNumber, Group: model.GLOBAL, Flag: model.PUBLIC, Help: `Chunk size in MB for chunked upload (5-90)`},
 
 		// single settings
 		{Key: conf.Token, Value: token, Type: conf.TypeString, Group: model.SINGLE, Flag: model.PRIVATE},

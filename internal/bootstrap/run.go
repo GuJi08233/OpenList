@@ -12,6 +12,7 @@ import (
 
 	"github.com/OpenListTeam/OpenList/v4/cmd/flags"
 	"github.com/OpenListTeam/OpenList/v4/internal/bootstrap/data"
+	"github.com/OpenListTeam/OpenList/v4/internal/chunked_upload"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
@@ -92,6 +93,7 @@ func Start() {
 	InitOfflineDownloadTools()
 	LoadStorages()
 	InitTaskManager()
+	chunked_upload.StartCleanup()
 	if !flags.Debug && !flags.Dev {
 		gin.SetMode(gin.ReleaseMode)
 	}

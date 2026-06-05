@@ -59,6 +59,8 @@ const (
 	HandleHookAfterWriting  = "handle_hook_after_writing"
 	HandleHookRateLimit     = "handle_hook_rate_limit"
 	IgnoreSystemFiles       = "ignore_system_files"
+	EnableChunkedUpload     = "enable_chunked_upload"
+	ChunkedUploadSize       = "chunked_upload_size"
 
 	// index
 	SearchIndex     = "search_index"
