@@ -304,6 +304,13 @@ func ChunkedUploadStatus(c *gin.Context) {
 		return
 	}
 
+	// Verify user ownership
+	user := c.Request.Context().Value(conf.UserKey).(*model.User)
+	if user.ID != session.UserID && !user.IsAdmin() {
+		common.ErrorStrResp(c, "permission denied", 403)
+		return
+	}
+
 	uploadedChunks := session.GetUploadedChunks()
 
 	common.SuccessResp(c, gin.H{

@@ -275,6 +275,7 @@ func Start() {
 
 func Shutdown(timeout time.Duration) {
 	utils.Log.Println("Shutdown server...")
+	chunked_upload.StopCleanup()
 	fs.ArchiveContentUploadTaskManager.RemoveAll()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
