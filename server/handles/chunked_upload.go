@@ -176,20 +176,6 @@ func ChunkedUploadChunk(c *gin.Context) {
 		return
 	}
 
-	// Protect against concurrent writes to the same chunk index.
-	// MarkChunkUploaded returns false if this chunk was already uploaded,
-	// which prevents duplicate/corrupt writes from retries.
-	if !session.MarkChunkUploaded(chunkIndex) {
-		// Chunk already marked — drain body and return success (idempotent for retries)
-		_, _ = io.Copy(io.Discard, c.Request.Body)
-		common.SuccessResp(c, gin.H{
-			"chunk_index":     chunkIndex,
-			"uploaded_chunks": session.UploadedCount(),
-			"total_chunks":    session.TotalChunks,
-		})
-		return
-	}
-
 	// Write chunk data to file, limiting read size to prevent disk exhaustion.
 	// Allow a small margin (4KB) over the expected chunk size for encoding overhead.
 	chunkPath := chunked_upload.ChunkPath(uploadID, chunkIndex)
@@ -209,6 +195,10 @@ func ChunkedUploadChunk(c *gin.Context) {
 		common.ErrorResp(c, fmt.Errorf("failed to write chunk data: %w", err), 500)
 		return
 	}
+
+	// Mark as uploaded only after successful write.
+	// If this chunk was already uploaded (concurrent retry), the second mark is a no-op.
+	session.MarkChunkUploaded(chunkIndex)
 
 	common.SuccessResp(c, gin.H{
 		"chunk_index":     chunkIndex,
