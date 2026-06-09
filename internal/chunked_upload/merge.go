@@ -11,37 +11,82 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 )
 
+type sequentialChunkReader struct {
+	session *Session
+	index   int
+	current *os.File
+	closed  bool
+}
+
+func (r *sequentialChunkReader) Read(p []byte) (int, error) {
+	if r.closed {
+		return 0, io.ErrClosedPipe
+	}
+	for {
+		if r.current == nil {
+			if r.index >= r.session.TotalChunks {
+				return 0, io.EOF
+			}
+			f, err := os.Open(ChunkPath(r.session.UploadID, r.index))
+			if err != nil {
+				return 0, fmt.Errorf("failed to open chunk %d: %w", r.index, err)
+			}
+			r.current = f
+		}
+
+		n, err := r.current.Read(p)
+		if err == io.EOF {
+			closeErr := r.current.Close()
+			r.current = nil
+			r.index++
+			if n > 0 {
+				if closeErr != nil {
+					return n, closeErr
+				}
+				return n, nil
+			}
+			if closeErr != nil {
+				return 0, closeErr
+			}
+			continue
+		}
+		return n, err
+	}
+}
+
+func (r *sequentialChunkReader) Close() error {
+	if r.closed {
+		return nil
+	}
+	r.closed = true
+	if r.current != nil {
+		err := r.current.Close()
+		r.current = nil
+		return err
+	}
+	return nil
+}
+
 // MergeChunks opens all chunk files in order and returns an io.Reader
 // that reads them sequentially, plus a cleanup function that closes all file handles.
 // Note: directory removal is handled separately by SessionManager.Delete.
 func MergeChunks(session *Session) (io.Reader, func() error, error) {
-	readers := make([]io.Reader, 0, session.TotalChunks)
-	closers := make([]io.Closer, 0, session.TotalChunks)
-
 	for i := 0; i < session.TotalChunks; i++ {
-		f, err := os.Open(ChunkPath(session.UploadID, i))
+		info, err := os.Stat(ChunkPath(session.UploadID, i))
 		if err != nil {
-			// Close any files already opened before returning error
-			for _, c := range closers {
-				c.Close()
-			}
 			return nil, nil, fmt.Errorf("failed to open chunk %d: %w", i, err)
 		}
-		readers = append(readers, f)
-		closers = append(closers, f)
+		expectedSize, ok := session.ExpectedChunkSize(i)
+		if !ok {
+			return nil, nil, fmt.Errorf("invalid chunk index %d", i)
+		}
+		if info.Size() != expectedSize {
+			return nil, nil, fmt.Errorf("invalid chunk %d size: expected %d, got %d", i, expectedSize, info.Size())
+		}
 	}
 
-	merged := io.MultiReader(readers...)
-	cleanup := func() error {
-		var firstErr error
-		for _, c := range closers {
-			if err := c.Close(); err != nil && firstErr == nil {
-				firstErr = err
-			}
-		}
-		return firstErr
-	}
-	return merged, cleanup, nil
+	merged := &sequentialChunkReader{session: session}
+	return merged, merged.Close, nil
 }
 
 // BuildFileStream creates a FileStream from a merged session.

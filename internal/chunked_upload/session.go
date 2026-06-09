@@ -19,6 +19,7 @@ const (
 	MaxChunkSize     = 90 * 1024 * 1024 // 90MB (< Cloudflare 100MB limit)
 	SessionTTL       = 24 * time.Hour
 	CleanupInterval  = 30 * time.Minute
+	UploadIDLength   = 16
 )
 
 // Session represents an in-progress chunked upload
@@ -30,6 +31,7 @@ type Session struct {
 	FileSize     int64  `json:"file_size"`
 	ChunkSize    int64  `json:"chunk_size"`
 	TotalChunks  int    `json:"total_chunks"`
+	Overwrite    bool   `json:"overwrite"`
 	MimeType     string `json:"mime_type"`
 	LastModified int64  `json:"last_modified"` // millisecond timestamp
 	CreatedAt    int64  `json:"created_at"`    // unix timestamp
@@ -43,6 +45,8 @@ type Session struct {
 	mu             sync.Mutex
 	uploadedChunks map[int]bool
 	chunkLocks     sync.Map // map[int]*sync.Mutex — per-chunk lock for concurrent uploads
+	completing     bool
+	completed      bool
 }
 
 // GetChunkLock returns the mutex for a specific chunk index, creating it if needed.
@@ -97,6 +101,47 @@ func (s *Session) IsComplete() bool {
 	return len(s.uploadedChunks) == s.TotalChunks
 }
 
+// BeginComplete marks the session as being completed.
+// It returns false when another complete request is already in progress or done.
+func (s *Session) BeginComplete() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.completing || s.completed {
+		return false
+	}
+	s.completing = true
+	return true
+}
+
+// FinishComplete clears the completing flag and records successful completion.
+func (s *Session) FinishComplete(success bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.completing = false
+	if success {
+		s.completed = true
+	}
+}
+
+// IsCompleting reports whether the session is currently being completed.
+func (s *Session) IsCompleting() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.completing
+}
+
+// ExpectedChunkSize returns the exact byte length required for a chunk index.
+func (s *Session) ExpectedChunkSize(index int) (int64, bool) {
+	if index < 0 || index >= s.TotalChunks {
+		return 0, false
+	}
+	if index == s.TotalChunks-1 {
+		size := s.FileSize - int64(index)*s.ChunkSize
+		return size, size > 0
+	}
+	return s.ChunkSize, true
+}
+
 // IsExpired returns true if the session has expired
 func (s *Session) IsExpired() bool {
 	return time.Now().Unix() > s.ExpiresAt
@@ -111,7 +156,7 @@ type SessionManager struct {
 var GlobalSessionManager = &SessionManager{}
 
 // Create creates a new chunked upload session
-func (m *SessionManager) Create(userID uint, fileName, filePath string, fileSize, chunkSize int64, mimeType string, lastModified int64, md5, sha1, sha256 string) *Session {
+func (m *SessionManager) Create(userID uint, fileName, filePath string, fileSize, chunkSize int64, overwrite bool, mimeType string, lastModified int64, md5, sha1, sha256 string) *Session {
 	totalChunks := int(math.Ceil(float64(fileSize) / float64(chunkSize)))
 	now := time.Now()
 	s := &Session{
@@ -122,6 +167,7 @@ func (m *SessionManager) Create(userID uint, fileName, filePath string, fileSize
 		FileSize:       fileSize,
 		ChunkSize:      chunkSize,
 		TotalChunks:    totalChunks,
+		Overwrite:      overwrite,
 		MimeType:       mimeType,
 		LastModified:   lastModified,
 		CreatedAt:      now.Unix(),
@@ -137,6 +183,9 @@ func (m *SessionManager) Create(userID uint, fileName, filePath string, fileSize
 
 // Get retrieves a session by upload ID
 func (m *SessionManager) Get(uploadID string) (*Session, bool) {
+	if !IsValidUploadID(uploadID) {
+		return nil, false
+	}
 	val, ok := m.sessions.Load(uploadID)
 	if !ok {
 		return nil, false
@@ -146,6 +195,9 @@ func (m *SessionManager) Get(uploadID string) (*Session, bool) {
 
 // Delete removes a session and its chunk files from disk
 func (m *SessionManager) Delete(uploadID string) {
+	if !IsValidUploadID(uploadID) {
+		return
+	}
 	m.sessions.Delete(uploadID)
 	os.RemoveAll(ChunkDir(uploadID))
 }
@@ -155,7 +207,7 @@ func (m *SessionManager) Cleanup() {
 	now := time.Now().Unix()
 	m.sessions.Range(func(key, value any) bool {
 		session := value.(*Session)
-		if now > session.ExpiresAt {
+		if now > session.ExpiresAt && !session.IsCompleting() {
 			os.RemoveAll(ChunkDir(session.UploadID))
 			m.sessions.Delete(key)
 		}
@@ -165,7 +217,21 @@ func (m *SessionManager) Cleanup() {
 
 // GenerateUploadID creates a random upload ID
 func GenerateUploadID() string {
-	return random.String(16)
+	return random.String(UploadIDLength)
+}
+
+// IsValidUploadID checks whether an upload ID can refer to a managed chunk dir.
+func IsValidUploadID(uploadID string) bool {
+	if len(uploadID) != UploadIDLength {
+		return false
+	}
+	for _, ch := range uploadID {
+		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // ChunkDir returns the filesystem path for chunk storage

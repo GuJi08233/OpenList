@@ -13,10 +13,12 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/internal/setting"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	"github.com/gin-gonic/gin"
+	"github.com/pkg/errors"
 )
 
 type ChunkedCreateReq struct {
@@ -38,6 +40,30 @@ type ChunkedCompleteReq struct {
 
 type ChunkedAbortReq struct {
 	UploadID string `json:"upload_id"`
+}
+
+func validateChunkedUploadTarget(c *gin.Context, user *model.User, filePath string, overwrite bool) bool {
+	parentPath := path.Dir(filePath)
+	parentMeta, err := op.GetNearestMeta(parentPath)
+	if err != nil && !errors.Is(errors.Cause(err), errs.MetaNotFound) {
+		common.ErrorResp(c, err, 500, true)
+		return false
+	}
+	if !user.CanWriteContent() && !common.CanWriteContentBypassUserPerms(parentMeta, parentPath) {
+		common.ErrorResp(c, errs.PermissionDenied, 403)
+		return false
+	}
+	if !common.CanWrite(user, parentMeta, parentPath) {
+		common.ErrorResp(c, errs.PermissionDenied, 403)
+		return false
+	}
+	if !overwrite {
+		if res, _ := fs.Get(c.Request.Context(), filePath, &fs.GetArgs{NoLog: true}); res != nil {
+			common.ErrorStrResp(c, "file exists", 403)
+			return false
+		}
+	}
+	return true
 }
 
 // ChunkedUploadCreate initializes a chunked upload session
@@ -68,9 +94,12 @@ func ChunkedUploadCreate(c *gin.Context) {
 		return
 	}
 
-	// Validate file name
-	if req.Name == "" {
-		req.Name = path.Base(filePath)
+	// Derive the final file name from the already-validated destination path.
+	// Never trust the client-provided name as it may contain path separators.
+	req.Name = path.Base(filePath)
+	if req.Name == "" || req.Name == "." || req.Name == "/" {
+		common.ErrorStrResp(c, "invalid file name", 400)
+		return
 	}
 
 	// Check if system file should be ignored (same as FsStream/FsForm)
@@ -116,13 +145,13 @@ func ChunkedUploadCreate(c *gin.Context) {
 
 	// Create session with user ownership
 	session := chunked_upload.GlobalSessionManager.Create(
-		user.ID, req.Name, filePath, req.Size, chunkSize, mimeType, req.LastModified,
+		user.ID, req.Name, filePath, req.Size, chunkSize, overwrite, mimeType, req.LastModified,
 		req.Md5, req.Sha1, req.Sha256,
 	)
 
 	// Create chunk directory
 	chunkDir := chunked_upload.ChunkDir(session.UploadID)
-	if err := os.MkdirAll(chunkDir, 0755); err != nil {
+	if err := os.MkdirAll(chunkDir, 0700); err != nil {
 		chunked_upload.GlobalSessionManager.Delete(session.UploadID)
 		common.ErrorResp(c, fmt.Errorf("failed to create chunk directory: %w", err), 500)
 		return
@@ -143,6 +172,10 @@ func ChunkedUploadChunk(c *gin.Context) {
 
 	if uploadID == "" || chunkIndexStr == "" {
 		common.ErrorStrResp(c, "missing Upload-Id or Chunk-Index header", 400)
+		return
+	}
+	if !chunked_upload.IsValidUploadID(uploadID) {
+		common.ErrorStrResp(c, "invalid Upload-Id", 400)
 		return
 	}
 
@@ -175,6 +208,15 @@ func ChunkedUploadChunk(c *gin.Context) {
 		common.ErrorStrResp(c, fmt.Sprintf("chunk index out of range [0, %d)", session.TotalChunks), 400)
 		return
 	}
+	expectedSize, ok := session.ExpectedChunkSize(chunkIndex)
+	if !ok {
+		common.ErrorStrResp(c, "invalid chunk index", 400)
+		return
+	}
+	if c.Request.ContentLength >= 0 && c.Request.ContentLength != expectedSize {
+		common.ErrorStrResp(c, fmt.Sprintf("invalid chunk size: expected %d, got %d", expectedSize, c.Request.ContentLength), 400)
+		return
+	}
 
 	// Per-chunk lock: serialize concurrent uploads of the same chunk index
 	// to prevent data corruption from overlapping writes.
@@ -193,23 +235,33 @@ func ChunkedUploadChunk(c *gin.Context) {
 		return
 	}
 
-	// Write chunk data to file, limiting read size to prevent disk exhaustion.
-	// Allow a small margin (4KB) over the expected chunk size for encoding overhead.
+	// Write chunk data to file, reading at most one byte over the expected size
+	// so oversized requests cannot exhaust disk space.
 	chunkPath := chunked_upload.ChunkPath(uploadID, chunkIndex)
-	out, err := os.Create(chunkPath)
+	out, err := os.OpenFile(chunkPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		common.ErrorResp(c, fmt.Errorf("failed to create chunk file: %w", err), 500)
 		return
 	}
-	defer out.Close()
 
-	limit := session.ChunkSize + 4096
+	limit := expectedSize + 1
 	limitedReader := io.LimitReader(c.Request.Body, limit)
 
 	written, err := io.Copy(out, limitedReader)
+	closeErr := out.Close()
 	if err != nil {
 		os.Remove(chunkPath)
 		common.ErrorResp(c, fmt.Errorf("failed to write chunk data: %w", err), 500)
+		return
+	}
+	if closeErr != nil {
+		os.Remove(chunkPath)
+		common.ErrorResp(c, fmt.Errorf("failed to close chunk file: %w", closeErr), 500)
+		return
+	}
+	if written != expectedSize {
+		os.Remove(chunkPath)
+		common.ErrorStrResp(c, fmt.Sprintf("invalid chunk size: expected %d, got %d", expectedSize, written), 400)
 		return
 	}
 
@@ -236,6 +288,10 @@ func ChunkedUploadComplete(c *gin.Context) {
 		common.ErrorStrResp(c, "missing upload_id", 400)
 		return
 	}
+	if !chunked_upload.IsValidUploadID(req.UploadID) {
+		common.ErrorStrResp(c, "invalid upload_id", 400)
+		return
+	}
 
 	session, ok := chunked_upload.GlobalSessionManager.Get(req.UploadID)
 	if !ok {
@@ -247,6 +303,20 @@ func ChunkedUploadComplete(c *gin.Context) {
 	user := c.Request.Context().Value(conf.UserKey).(*model.User)
 	if user.ID != session.UserID && !user.IsAdmin() {
 		common.ErrorStrResp(c, "permission denied", 403)
+		return
+	}
+	if !session.BeginComplete() {
+		common.ErrorStrResp(c, "upload session is already completing or completed", 409)
+		return
+	}
+	completeSucceeded := false
+	defer func() {
+		session.FinishComplete(completeSucceeded)
+	}()
+	unlockTarget := chunked_upload.LockTarget(session.FilePath)
+	defer unlockTarget()
+
+	if !validateChunkedUploadTarget(c, user, session.FilePath, session.Overwrite) {
 		return
 	}
 
@@ -286,10 +356,12 @@ func ChunkedUploadComplete(c *gin.Context) {
 	if req.AsTask {
 		taskInfo, putErr := fs.PutAsTask(c.Request.Context(), dir, fileStream)
 		if putErr != nil {
+			_ = fileStream.Close()
 			chunked_upload.GlobalSessionManager.Delete(req.UploadID)
 			common.ErrorResp(c, putErr, 500)
 			return
 		}
+		completeSucceeded = true
 		chunked_upload.GlobalSessionManager.Delete(req.UploadID)
 		common.SuccessResp(c, gin.H{
 			"task": getTaskInfo(taskInfo),
@@ -297,10 +369,12 @@ func ChunkedUploadComplete(c *gin.Context) {
 	} else {
 		putErr := fs.PutDirectly(c.Request.Context(), dir, fileStream)
 		if putErr != nil {
+			_ = fileStream.Close()
 			chunked_upload.GlobalSessionManager.Delete(req.UploadID)
 			common.ErrorResp(c, putErr, 500)
 			return
 		}
+		completeSucceeded = true
 		chunked_upload.GlobalSessionManager.Delete(req.UploadID)
 		common.SuccessResp(c)
 	}
@@ -311,6 +385,10 @@ func ChunkedUploadStatus(c *gin.Context) {
 	uploadID := c.Query("upload_id")
 	if uploadID == "" {
 		common.ErrorStrResp(c, "missing upload_id parameter", 400)
+		return
+	}
+	if !chunked_upload.IsValidUploadID(uploadID) {
+		common.ErrorStrResp(c, "invalid upload_id parameter", 400)
 		return
 	}
 
@@ -353,6 +431,10 @@ func ChunkedUploadAbort(c *gin.Context) {
 		common.ErrorStrResp(c, "missing upload_id", 400)
 		return
 	}
+	if !chunked_upload.IsValidUploadID(req.UploadID) {
+		common.ErrorStrResp(c, "invalid upload_id", 400)
+		return
+	}
 
 	// Verify user ownership before aborting
 	if session, ok := chunked_upload.GlobalSessionManager.Get(req.UploadID); ok {
@@ -361,8 +443,12 @@ func ChunkedUploadAbort(c *gin.Context) {
 			common.ErrorStrResp(c, "permission denied", 403)
 			return
 		}
+		if session.IsCompleting() {
+			common.ErrorStrResp(c, "upload session is completing", 409)
+			return
+		}
+		chunked_upload.GlobalSessionManager.Delete(req.UploadID)
 	}
 
-	chunked_upload.GlobalSessionManager.Delete(req.UploadID)
 	common.SuccessResp(c)
 }
